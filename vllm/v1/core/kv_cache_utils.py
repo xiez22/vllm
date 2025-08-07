@@ -86,6 +86,9 @@ class PrefixCachingMetrics:
         self.aggregated_query_total += stats.queries
         self.aggregated_query_hit += stats.hits
 
+        if stats.queries > 0:
+            logger.warning(f"PrefixCacheMetrics: {stats.requests} requests, {stats.queries} queries, {stats.hits} hits")
+
         # Remove the oldest stats if the number of requests exceeds.
         if self.aggregated_requests > self.max_recent_requests:
             old_requests, old_queries, old_hits = self.query_queue.popleft()

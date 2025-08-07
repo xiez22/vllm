@@ -324,6 +324,26 @@ def test_processing_correctness(
 
 
 # yapf: disable
+@pytest.mark.parametrize("model_id", ["bytedance-research/ChatTS-14B"])
+@pytest.mark.parametrize("hit_rate", [0.3, 0.5, 1.0])
+@pytest.mark.parametrize("num_batches", [32])
+@pytest.mark.parametrize("simplify_rate", [1.0])
+# yapf: enable
+def test_processing_correctness_chatts(
+    model_id: str,
+    hit_rate: float,
+    num_batches: int,
+    simplify_rate: float,
+):
+
+    _test_processing_correctness(
+        model_id,
+        hit_rate=hit_rate,
+        num_batches=num_batches,
+        simplify_rate=simplify_rate
+    )
+
+
 @pytest.mark.parametrize("model_id", ["microsoft/Phi-3.5-vision-instruct"])
 @pytest.mark.parametrize("hit_rate", [0.3, 0.5, 1.0])
 @pytest.mark.parametrize("num_batches", [32])

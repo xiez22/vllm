@@ -206,3 +206,7 @@ shellcheck*/
 
 # Ingore moe/marlin_moe gen code
 csrc/moe/marlin_moe_wna16/kernel_*
+request1.json
+request5.json
+test_chatts.py
+test_request5.py

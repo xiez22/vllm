@@ -9,7 +9,7 @@ from pathlib import PosixPath
 
 import pytest
 from transformers import (AutoModel, AutoModelForImageTextToText,
-                          AutoModelForTextToWaveform, AutoModelForVision2Seq)
+                          AutoModelForTextToWaveform, AutoModelForVision2Seq, AutoModelForCausalLM)
 
 from vllm.platforms import current_platform
 from vllm.utils import identity
@@ -671,6 +671,18 @@ VLM_TEST_SETTINGS = {
             limit_mm_per_prompt={"image": 1},
         )],
     ),
+    "chatts": VLMTestInfo(
+        models=["Qwen/Qwen2.5-VL-3B-Instruct"],
+        test_type=VLMTestType.CUSTOM_INPUTS,
+        max_model_len=4096,
+        max_num_seqs=2,
+        auto_cls=AutoModelForCausalLM,
+        vllm_output_post_proc=model_utils.qwen2_vllm_to_hf_output,
+        custom_test_opts=[CustomTestOptions(
+            inputs=custom_inputs.windows_attention_image_qwen2_5_vl(),
+            limit_mm_per_prompt={"image": 1},
+        )],
+    )
 }
 # yapf: enable
 
