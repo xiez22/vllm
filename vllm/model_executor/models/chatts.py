@@ -376,9 +376,16 @@ class Qwen2TSForCausalLM(nn.Module, SupportsMultiModal, SupportsPP,
             return None
 
         # ChatTS processor returns a list of tuples
-        # (ts_tokens, encoded_ts_arrays)
-        encoded_ts_arrays = [ts[0][1] for ts in timeseries]
-        # ts_tokens, encoded_ts_arrays = zip(*timeseries)
+        
+        # timeseries (batch x (ts_tokens, num_ts x encoded_ts) or batch x num_ts x (ts_tokens, encoded_ts))
+        encoded_ts_arrays = []
+        for batch in timeseries:
+            if not isinstance(batch[0], list):
+                encoded_ts_arrays.append(batch[1])
+            else:
+                # flatten the ts first
+                for ts in batch:
+                    encoded_ts_arrays.append(ts[1])
 
         device = encoded_ts_arrays[0].device
 
@@ -465,14 +472,14 @@ class Qwen2TSForCausalLM(nn.Module, SupportsMultiModal, SupportsPP,
             inputs_embeds = self.get_input_embeddings(input_ids, ts_features)
             input_ids = None
 
-        if inputs_embeds is not None and inputs_embeds.shape[0] > 0:
-            if inputs_embeds.shape[0] <= 16:
-                for i, p in enumerate(inputs_embeds):
-                    print(f"[DEBUG] inputs_embeds: {i}", p)
-            else:
-                print(f"[DEBUG] inputs_embeds shape: {inputs_embeds.shape if inputs_embeds is not None else 'None'}, inputs_embeds: {inputs_embeds}")
-        print(f"[DEBUG] input_ids shape: {input_ids.shape if input_ids is not None else 'None'}, input_ids: {input_ids}")
-        print(f"[DEBUG] positions shape: {positions.shape if positions is not None else 'None'}, positions: {positions}")
+        # if inputs_embeds is not None and inputs_embeds.shape[0] > 0:
+        #     if inputs_embeds.shape[0] <= 16:
+        #         for i, p in enumerate(inputs_embeds):
+        #             print(f"[DEBUG] inputs_embeds: {i}", p)
+        #     else:
+        #         print(f"[DEBUG] inputs_embeds shape: {inputs_embeds.shape if inputs_embeds is not None else 'None'}, inputs_embeds: {inputs_embeds}")
+        # print(f"[DEBUG] input_ids shape: {input_ids.shape if input_ids is not None else 'None'}, input_ids: {input_ids}")
+        # print(f"[DEBUG] positions shape: {positions.shape if positions is not None else 'None'}, positions: {positions}")
 
         hidden_states = self.language_model.model(input_ids,
                                                   positions,
