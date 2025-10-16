@@ -52,7 +52,7 @@ class TimeSeriesEmbedding(nn.Module):
         self.num_layers = config['num_layers']
         self.hidden_size = config['hidden_size']
         self.num_features = config['num_features']
-        self.max_sequence_length = config.get('max_sequence_length', config['max_length'])  # Maximum time series length
+        self.max_sequence_length = config['max_sequence_length']  # Maximum time series length
         self.use_position_embedding = config.get('use_position_embedding', False)
         self.use_position_idx = config.get('use_position_idx', False)
         self.embedding_dim = config.get('embedding_dim', 16)  # Embedding dimension
@@ -107,23 +107,21 @@ class TimeSeriesEmbedding(nn.Module):
             
             if padding_length > 0:
                 # Pad with last value
-                if self.use_position_embedding:
-                    last_value = xi[-1:, :]
-                    padding = last_value.repeat(padding_length, 1)
-                else:
-                    padding = torch.zeros((padding_length, 1), device=x.device)
+                last_value = xi[-1:, :]
+                padding = last_value.repeat(padding_length, 1)
                 xi = torch.cat([xi, padding], dim=0)
                 
-                # Use special padding index for padding positions
-                padding_positions = torch.full((padding_length,), self.padding_idx, device=x.device)
-                position_indices = torch.cat([position_indices, padding_positions], dim=0)
+                # Use special padding index for padding positions when use_position_embedding enabled
+                if self.use_position_embedding:
+                    padding_positions = torch.full((padding_length,), self.padding_idx, device=x.device)
+                    position_indices = torch.cat([position_indices, padding_positions], dim=0)
 
             # Reshape to patches
             xi = xi.reshape(pc, self.patch_size)  # (num_patches, patch_size)
-            position_indices = position_indices.reshape(pc, self.patch_size)  # (num_patches, patch_size)
-
+            
             if self.use_position_embedding:
                 # Collect position indices instead of calling embedding immediately
+                position_indices = position_indices.reshape(pc, self.patch_size)  # (num_patches, patch_size)
                 all_position_indices.append(position_indices)
                 patch_info_list.append({
                     'xi': xi,
