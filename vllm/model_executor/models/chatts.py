@@ -52,7 +52,7 @@ class TimeSeriesEmbedding(nn.Module):
         self.num_layers = config['num_layers']
         self.hidden_size = config['hidden_size']
         self.num_features = config['num_features']
-        self.max_sequence_length = config['max_sequence_length']  # Maximum time series length
+        self.max_sequence_length = config.get('max_sequence_length', config.get('max_length', 4096))
         self.use_position_embedding = config.get('use_position_embedding', False)
         self.use_position_idx = config.get('use_position_idx', False)
         self.embedding_dim = config.get('embedding_dim', 16)  # Embedding dimension
