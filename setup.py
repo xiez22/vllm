@@ -81,6 +81,52 @@ def is_url_available(url: str) -> bool:
     return status == 200
 
 
+def download_with_progress(url: str, destination: str) -> None:
+    """Download a file and display a simple ASCII progress bar."""
+    from urllib.request import urlretrieve
+
+    last_percent = -1
+    wrote_newline = False
+    stream = sys.stderr
+
+    def reporthook(block_num: int, block_size: int, total_size: int) -> None:
+        nonlocal last_percent, wrote_newline
+
+        if total_size > 0:
+            downloaded = min(total_size, block_num * block_size)
+            percent = int(downloaded * 100 / total_size)
+            if percent != last_percent:
+                bar_length = 40
+                filled_length = percent * bar_length // 100
+                bar = "#" * filled_length + "-" * (bar_length - filled_length)
+                total_mb = total_size / (1024 * 1024)
+                downloaded_mb = downloaded / (1024 * 1024)
+                stream.write(
+                    f"\r  Downloading wheel: [{bar}] {percent:3d}% ({downloaded_mb:.1f}/{total_mb:.1f} MB)"
+                )
+                stream.flush()
+                last_percent = percent
+            if downloaded >= total_size and not wrote_newline:
+                stream.write("\n")
+                stream.flush()
+                wrote_newline = True
+        else:
+            # total size is unknown; emit periodic byte counts instead
+            if block_num > 0 and block_num % 128 == 0:
+                downloaded_mb = block_num * block_size / (1024 * 1024)
+                stream.write(
+                    f"\r  Downloaded {downloaded_mb:.1f} MB (size unknown)"
+                )
+                stream.flush()
+
+    try:
+        urlretrieve(url, filename=destination, reporthook=reporthook)
+    finally:
+        if not wrote_newline:
+            stream.write("\n")
+            stream.flush()
+
+
 class CMakeExtension(Extension):
 
     def __init__(self, name: str, cmake_lists_dir: str = '.', **kwa) -> None:
@@ -360,14 +406,13 @@ class repackage_wheel(build_ext):
             temp_dir = tempfile.mkdtemp(prefix="vllm-wheels")
             wheel_path = os.path.join(temp_dir, wheel_filename)
 
-            print(f"Downloading wheel from {wheel_location} to {wheel_path}")
-
-            from urllib.request import urlretrieve
+            sys.stderr.write(f"Downloading wheel from {wheel_location} to {wheel_path}. If this takes too long, you can manually download the wheel and set the VLLM_PRECOMPILED_WHEEL_LOCATION environment variable to point to the local file. If the progress is 0%, please check your network connection.\n")
 
             try:
-                urlretrieve(wheel_location, filename=wheel_path)
+                download_with_progress(wheel_location, wheel_path)
+                sys.stderr.write(f"Successfully downloaded wheel to {wheel_path}\n")
             except Exception as e:
-                from setuptools.errors import SetupError
+                from setuptools.errors import SetupError  # type: ignore[import-not-found]
 
                 raise SetupError(
                     f"Failed to get vLLM wheel from {wheel_location}") from e
@@ -592,6 +637,8 @@ def get_vllm_version() -> str:
     else:
         raise RuntimeError("Unknown runtime environment")
 
+    print(f"[DEBUG] {version=}")
+
     return version
 
 
@@ -640,6 +687,8 @@ def get_requirements() -> list[str]:
         raise ValueError(
             "Unsupported platform, please use CUDA, ROCm, Neuron, HPU, "
             "or CPU.")
+
+    print(f"[DEBUG] {requirements=}")
     return requirements
 
 
@@ -684,6 +733,8 @@ else:
         "build_ext":
         repackage_wheel if envs.VLLM_USE_PRECOMPILED else cmake_build_ext
     }
+
+print(f"[DEBUG] {ext_modules=}")
 
 setup(
     # static metadata should rather go in pyproject.toml
