@@ -383,6 +383,7 @@ class repackage_wheel(build_ext):
 
         wheel_location = os.getenv("VLLM_PRECOMPILED_WHEEL_LOCATION", None)
         if wheel_location is None:
+            sys.stderr.write(f"Fetching precompiled wheel for CUDA build... If you stuck here, please check your network connection.\n")
             base_commit = self.get_base_commit_in_main_branch()
             wheel_location = f"https://wheels.vllm.ai/{base_commit}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl"
             # Fallback to nightly wheel if latest commit wheel is unavailable,
@@ -394,7 +395,7 @@ class repackage_wheel(build_ext):
 
         if os.path.isfile(wheel_location):
             wheel_path = wheel_location
-            print(f"Using existing wheel={wheel_path}")
+            sys.stderr.write(f"Using existing wheel={wheel_path}")
         else:
             # Download the wheel from a given URL, assume
             # the filename is the last part of the URL
