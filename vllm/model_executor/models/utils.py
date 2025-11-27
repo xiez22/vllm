@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Callable, Literal, Optional, Protocol, Union, overload
+from typing import Any, Callable, Literal, Optional, Protocol, Union, overload
 
 import torch
 import torch.nn as nn
@@ -12,11 +13,14 @@ from transformers import PretrainedConfig
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.distributed import (get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size)
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.multimodal import MultiModalPlaceholderMap, NestedTensors
+from vllm.multimodal import NestedTensors
 from vllm.sequence import IntermediateTensors
-from vllm.utils import (get_cuda_view_from_cpu_tensor, is_pin_memory_available,
+from vllm.utils import (cdiv, direct_register_custom_op,
+                        get_cuda_view_from_cpu_tensor, is_pin_memory_available,
                         is_uva_available)
 
 logger = init_logger(__name__)
@@ -63,10 +67,23 @@ class WeightsMapper:
         return ((out_name, data) for name, data in weights
                 if (out_name := self._map_name(name)) is not None)
 
+    def apply_list(self, values: list[str]) -> list[str]:
+        return [
+            out_name for name in values
+            if (out_name := self._map_name(name)) is not None
+        ]
+
+    def apply_dict(self, values: dict[str, Any]) -> dict[str, Any]:
+        return {
+            out_name: value
+            for name, value in values.items()
+            if (out_name := self._map_name(name)) is not None
+        }
+
 
 class AutoWeightsLoader:
     """
-    Helper class to load weights into a {class}`torch.nn.Module`. It is able
+    Helper class to load weights into a [`torch.nn.Module`][]. It is able
     to automatically detect child modules and parameters while iterating over
     the weights only once.
 
@@ -80,18 +97,30 @@ class AutoWeightsLoader:
     environment variable ``VLLM_LOGGING_LEVEL=DEBUG``.
     """
 
+    # Models trained using early version ColossalAI
+    # may include these tensors in checkpoint. Skip them.
+    ROTARY_EMBEDS_UNUSED_WEIGHTS = [
+        "rotary_emb.inv_freq",
+        "rotary_emb.cos_cached",
+        "rotary_emb.sin_cached",
+    ]
+
     def __init__(
         self,
         module: nn.Module,
         *,
         skip_prefixes: Optional[list[str]] = None,
+        skip_substrs: Optional[list[str]] = None,
         ignore_unexpected_prefixes: Optional[list[str]] = None,
     ) -> None:
         super().__init__()
 
         self.module = module
         self.skip_prefixes = skip_prefixes or []
+        self.skip_substrs = skip_substrs or []
         self.ignore_unexpected_prefixes = ignore_unexpected_prefixes or []
+        # update default skip_substrs
+        self.skip_substrs += self.ROTARY_EMBEDS_UNUSED_WEIGHTS
 
     def _groupby_prefix(
         self,
@@ -119,7 +148,8 @@ class AutoWeightsLoader:
         return ".".join((prefix, rest))
 
     def _can_skip(self, qualname: str) -> bool:
-        return any(qualname.startswith(p) for p in self.skip_prefixes)
+        return (any(qualname.startswith(p) for p in self.skip_prefixes)
+                or any(substr in qualname for substr in self.skip_substrs))
 
     def _can_ignore_unexpected(self, qualname: str) -> bool:
         return any(
@@ -257,6 +287,9 @@ class AutoWeightsLoader:
     ) -> set[str]:
         if mapper is not None:
             weights = mapper.apply(weights)
+        # filter out weights with first-prefix/substr to skip in name
+        weights = ((name, weight) for name, weight in weights
+                   if not self._can_skip(name))
 
         autoloaded_weights = set(self._load_module("", self.module, weights))
         return autoloaded_weights
@@ -359,22 +392,6 @@ def _embedding_count_expression(embeddings: NestedTensors) -> str:
         _embedding_count_expression(inner) for inner in embeddings)
 
 
-def merge_multimodal_embeddings_from_map(
-        inputs_embeds: torch.Tensor, multimodal_embeddings: NestedTensors,
-        placeholder_map: MultiModalPlaceholderMap.IndexMap) -> torch.Tensor:
-    """
-    Merge ``multimodal_embeddings`` into ``inputs_embeds`` using the provided 
-    placeholder map .
-
-    Note:
-        This updates ``inputs_embeds`` in place.
-    """
-    flattened_embeddings = _flatten_embeddings(multimodal_embeddings)
-    inputs_embeds[placeholder_map.dest] = flattened_embeddings[
-        placeholder_map.src]
-    return inputs_embeds
-
-
 def _merge_multimodal_embeddings(
     inputs_embeds: torch.Tensor,
     is_multimodal: torch.Tensor,
@@ -388,17 +405,24 @@ def _merge_multimodal_embeddings(
     Note:
         This updates ``inputs_embeds`` in place.
     """
-    num_expected_tokens = is_multimodal.sum().item()
-    assert isinstance(num_expected_tokens, int)
-
     flattened = _flatten_embeddings(multimodal_embeddings)
-    if flattened.shape[0] != num_expected_tokens:
-        expr = _embedding_count_expression(multimodal_embeddings)
-        raise ValueError(
-            f"Attempted to assign {expr} = {flattened.shape[0]} "
-            f"multimodal tokens to {num_expected_tokens} placeholders")
+    try:
+        # This is equivalent to: inputs_embeds[is_multimodal] = flattened.
+        inputs_embeds.masked_scatter_(is_multimodal.unsqueeze(-1),
+                                      flattened.to(dtype=inputs_embeds.dtype))
+    except RuntimeError as e:
+        num_expected_tokens = is_multimodal.sum().item()
+        assert isinstance(num_expected_tokens, int)
 
-    inputs_embeds[is_multimodal] = flattened
+        if flattened.shape[0] != num_expected_tokens:
+            expr = _embedding_count_expression(multimodal_embeddings)
+            raise ValueError(
+                f"Attempted to assign {expr} = {flattened.shape[0]} "
+                f"multimodal tokens to {num_expected_tokens} placeholders"
+            ) from e
+        else:
+            raise ValueError("Error during masked scatter operation") from e
+
     return inputs_embeds
 
 
@@ -448,11 +472,11 @@ def merge_multimodal_embeddings(
     Merge ``multimodal_embeddings`` into ``inputs_embeds`` by overwriting the
     positions in ``inputs_embeds`` corresponding to placeholder tokens in
     ``input_ids``.
-    
-    ``placeholder_token_id`` can be a list of token ids (e.g, token ids 
-    of img_start, img_break, and img_end tokens) when needed: This means 
-    the order of these tokens in the ``input_ids`` MUST MATCH the order of 
-    their embeddings in ``multimodal_embeddings`` since we need to 
+
+    ``placeholder_token_id`` can be a list of token ids (e.g, token ids
+    of img_start, img_break, and img_end tokens) when needed: This means
+    the order of these tokens in the ``input_ids`` MUST MATCH the order of
+    their embeddings in ``multimodal_embeddings`` since we need to
     slice-merge instead of individually scattering.
 
     For example, if input_ids is "TTTTTSIIIBIIIBIIIETTT", where
@@ -461,17 +485,19 @@ def merge_multimodal_embeddings(
     - I is image embedding token
     - B is image break token
     - E is image end token.
-    
-    Then the image embeddings (that correspond to I's) from vision encoder 
-    must be padded with embeddings of S, B, and E in the same order of 
+
+    Then the image embeddings (that correspond to I's) from vision encoder
+    must be padded with embeddings of S, B, and E in the same order of
     input_ids for a correct embedding merge.
 
     Note:
         This updates ``inputs_embeds`` in place.
     """
     if isinstance(placeholder_token_id, list):
-        placeholder_token_id = torch.tensor(placeholder_token_id,
-                                            device=input_ids.device)
+        placeholder_token_id = torch.tensor(
+            placeholder_token_id,
+            pin_memory=is_pin_memory_available()).to(device=input_ids.device,
+                                                     non_blocking=True)
         return _merge_multimodal_embeddings(
             inputs_embeds,
             torch.isin(input_ids, placeholder_token_id),
@@ -498,16 +524,10 @@ class PPMissingLayer(torch.nn.Identity):
 
     def __init__(self, *args, **kwargs):
         super().__init__()
-        self.return_tuple = kwargs.get("return_tuple", False)
 
     def forward(self, *args, **kwargs):
-        """
-        Return the first arg from args or the first value from kwargs.
-
-        Wraps the input in a tuple if `self.return_tuple` is True.
-        """
-        input = args[0] if args else next(iter(kwargs.values()))
-        return (input, ) if self.return_tuple else input
+        """Return the first arg from args or the first value from kwargs."""
+        return args[0] if args else next(iter(kwargs.values()))
 
 
 _CPU_OFFLOAD_BYTES = 0
@@ -674,14 +694,14 @@ def maybe_prefix(prefix: str, name: str) -> str:
     return name if not prefix else f"{prefix}.{name}"
 
 
-def extract_layer_index(layer_name: str) -> int:
+def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
     """
     Extract the layer index from the module name.
     Examples:
     - "encoder.layers.0" -> 0
     - "encoder.layers.1.self_attn" -> 1
     - "2.self_attn" -> 2
-    - "model.encoder.layers.0.sub.1" -> ValueError
+    - "model.encoder.layers.0.sub.1" -> ValueError if num_attn_module == 1
     """
     subnames = layer_name.split(".")
     int_vals: list[int] = []
@@ -690,9 +710,17 @@ def extract_layer_index(layer_name: str) -> int:
             int_vals.append(int(subname))
         except ValueError:
             continue
-    assert len(int_vals) == 1, (f"layer name {layer_name} should"
-                                " only contain one integer")
-    return int_vals[0]
+    if num_attn_module == 1 or "attn" not in layer_name:
+        assert len(int_vals) == 1, (f"layer name {layer_name} should"
+                                    " only contain one integer")
+
+        return int_vals[0]
+    else:
+        assert len(int_vals) <= 2, (f"layer name {layer_name} should"
+                                    " contain most two integers")
+        layer_index = int_vals[0] * num_attn_module + int_vals[1] if len(
+            int_vals) == 2 else int_vals[0]
+        return layer_index
 
 
 def cast_overflow_tensors(
@@ -705,10 +733,76 @@ def cast_overflow_tensors(
     return tensors
 
 
-def fast_topk(values, topk, dim):
+def fast_topk(values: torch.Tensor, topk: int,
+              dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Optimized topk implementation that uses torch.max for k=1 case.
+    
+    This function provides better performance for the common case of k=1
+    by using torch.max instead of the more general torch.topk.
+    
+    Args:
+        values: Input tensor to find top-k values from
+        topk: Number of top values to return (k). Must be > 0.
+        dim: Dimension along which to compute topk
+        
+    Returns:
+        Tuple of (values, indices) where values are the top-k values
+        and indices are their corresponding indices in the input tensor
+    """
     if topk == 1:
         # Use max along the specified dimension to get both value and index
         return torch.max(values, dim=dim, keepdim=True)
     else:
         # Use topk for efficiency with larger k values
         return torch.topk(values, topk, dim=dim)
+
+
+def get_model_hidden_size(hf_config: PretrainedConfig) -> int:
+    if hasattr(hf_config, "hidden_size"):
+        return hf_config.hidden_size
+    text_config = hf_config.get_text_config()
+    return text_config.hidden_size
+
+
+# Chunk x along the num_tokens axis for sequence parallelism
+# NOTE: This is wrapped in a torch custom op to work around the following issue:
+# The output tensor can have a sequence length 0 at small input sequence lengths
+# even though we explicitly pad to avoid this.
+def sequence_parallel_chunk(x: torch.Tensor) -> torch.Tensor:
+    return torch.ops.vllm.sequence_parallel_chunk_impl(x)
+
+
+def sequence_parallel_chunk_impl(x: torch.Tensor) -> torch.Tensor:
+    tp_size = get_tensor_model_parallel_world_size()
+    tp_rank = get_tensor_model_parallel_rank()
+
+    # all_gather needs the sequence length to be divisible by tp_size
+    seq_len = x.size(0)
+    remainder = seq_len % tp_size
+    if remainder != 0:
+        pad_len = tp_size - remainder
+        y = nn.functional.pad(x, (0, 0, 0, pad_len))
+    else:
+        y = x
+
+    chunk = y.shape[0] // tp_size
+    start = tp_rank * chunk
+    return torch.narrow(y, 0, start, chunk)
+
+
+def sequence_parallel_chunk_impl_fake(x: torch.Tensor) -> torch.Tensor:
+    tp_size = get_tensor_model_parallel_world_size()
+    seq_len = cdiv(x.size(0), tp_size)
+    shape = list(x.shape)
+    shape[0] = seq_len
+    out = torch.empty(shape, dtype=x.dtype, device=x.device)
+    return out
+
+
+direct_register_custom_op(
+    op_name="sequence_parallel_chunk_impl",
+    op_func=sequence_parallel_chunk_impl,
+    fake_impl=sequence_parallel_chunk_impl_fake,
+    tags=(torch.Tag.needs_fixed_stride_order, ),
+)

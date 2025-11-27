@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
-import re
 from collections.abc import Sequence
 from json import JSONDecoder
 from typing import Union
 
 import partial_json_parser
+import regex as re
 from partial_json_parser.core.options import Allow
 
-from vllm.entrypoints.chat_utils import random_tool_call_id
+from vllm.entrypoints.chat_utils import make_tool_call_id
 from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
                                               DeltaFunctionCall, DeltaMessage,
                                               DeltaToolCall,
@@ -80,7 +81,8 @@ class Granite20bFCToolParser(ToolParser):
                     function=FunctionCall(
                         name=function_call["name"],
                         # function call args are JSON but as a string
-                        arguments=json.dumps(function_call["arguments"]),
+                        arguments=json.dumps(function_call["arguments"],
+                                             ensure_ascii=False),
                     ),
                 ) for function_call in raw_function_calls
             ]
@@ -166,7 +168,8 @@ class Granite20bFCToolParser(ToolParser):
                 if self.current_tool_id >= 0:
                     cur_arguments = current_tool_call.get("arguments")
                     if cur_arguments:
-                        cur_args_json = json.dumps(cur_arguments)
+                        cur_args_json = json.dumps(cur_arguments,
+                                                   ensure_ascii=False)
                         sent = len(
                             self.streamed_args_for_tool[self.current_tool_id])
                         argument_diff = cur_args_json[sent:]
@@ -200,7 +203,7 @@ class Granite20bFCToolParser(ToolParser):
                     delta = DeltaMessage(tool_calls=[
                         DeltaToolCall(index=self.current_tool_id,
                                       type="function",
-                                      id=random_tool_call_id(),
+                                      id=make_tool_call_id(),
                                       function=DeltaFunctionCall(
                                           name=function_name).model_dump(
                                               exclude_none=True))
@@ -218,7 +221,8 @@ class Granite20bFCToolParser(ToolParser):
                 if cur_arguments:
                     sent = len(
                         self.streamed_args_for_tool[self.current_tool_id])
-                    cur_args_json = json.dumps(cur_arguments)
+                    cur_args_json = json.dumps(cur_arguments,
+                                               ensure_ascii=False)
                     prev_arguments = self.prev_tool_call_arr[
                         self.current_tool_id].get("arguments")
 
@@ -226,7 +230,8 @@ class Granite20bFCToolParser(ToolParser):
                     if is_complete[self.current_tool_id]:
                         argument_diff = cur_args_json[sent:]
                     elif prev_arguments:
-                        prev_args_json = json.dumps(prev_arguments)
+                        prev_args_json = json.dumps(prev_arguments,
+                                                    ensure_ascii=False)
                         if cur_args_json != prev_args_json:
 
                             prefix = find_common_prefix(

@@ -1,17 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import dataclasses
 import functools
 import os
-from typing import Any, Optional
+from argparse import Namespace
+from typing import Any, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask, BackgroundTasks
 
+from vllm.engine.arg_utils import EngineArgs
+from vllm.entrypoints.openai.cli_args import make_arg_parser
+from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
+                                              CompletionRequest)
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
+from vllm.utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
+
+VLLM_SUBCMD_PARSER_EPILOG = (
+    "For full list:            vllm {subcmd} --help=all\n"
+    "For a section:            vllm {subcmd} --help=ModelConfig    (case-insensitive)\n"  # noqa: E501
+    "For a flag:               vllm {subcmd} --help=max-model-len  (_ or - accepted)\n"  # noqa: E501
+    "Documentation:            https://docs.vllm.ai\n")
 
 
 async def listen_for_disconnect(request: Request) -> None:
@@ -19,6 +34,13 @@ async def listen_for_disconnect(request: Request) -> None:
     while True:
         message = await request.receive()
         if message["type"] == "http.disconnect":
+            # If load tracking is enabled *and* the counter exists, decrement
+            # it. Combines the previous nested checks into a single condition
+            # to satisfy the linter rule.
+            if (getattr(request.app.state, "enable_server_load_tracking",
+                        False)
+                    and hasattr(request.app.state, "server_load_metrics")):
+                request.app.state.server_load_metrics -= 1
             break
 
 
@@ -82,8 +104,13 @@ def load_aware_call(func):
             raise ValueError(
                 "raw_request required when server load tracking is enabled")
 
-        if not raw_request.app.state.enable_server_load_tracking:
+        if not getattr(raw_request.app.state, "enable_server_load_tracking",
+                       False):
             return await func(*args, **kwargs)
+
+        # ensure the counter exists
+        if not hasattr(raw_request.app.state, "server_load_metrics"):
+            raw_request.app.state.server_load_metrics = 0
 
         raw_request.app.state.server_load_metrics += 1
         try:
@@ -157,4 +184,50 @@ def _validate_truncation_size(
             tokenization_kwargs["truncation"] = True
             tokenization_kwargs["max_length"] = truncate_prompt_tokens
 
+    else:
+        if tokenization_kwargs is not None:
+            tokenization_kwargs["truncation"] = False
+
     return truncate_prompt_tokens
+
+
+def get_max_tokens(max_model_len: int, request: Union[ChatCompletionRequest,
+                                                      CompletionRequest],
+                   input_length: int, default_sampling_params: dict) -> int:
+
+    max_tokens = getattr(request, "max_completion_tokens",
+                         None) or request.max_tokens
+    default_max_tokens = max_model_len - input_length
+    max_output_tokens = current_platform.get_max_output_tokens(input_length)
+
+    return min(val
+               for val in (default_max_tokens, max_tokens, max_output_tokens,
+                           default_sampling_params.get("max_tokens"))
+               if val is not None)
+
+
+def log_non_default_args(args: Union[Namespace, EngineArgs]):
+    non_default_args = {}
+
+    # Handle Namespace
+    if isinstance(args, Namespace):
+        parser = make_arg_parser(FlexibleArgumentParser())
+        for arg, default in vars(parser.parse_args([])).items():
+            if default != getattr(args, arg):
+                non_default_args[arg] = getattr(args, arg)
+
+    # Handle EngineArgs instance
+    elif isinstance(args, EngineArgs):
+        default_args = EngineArgs(model=args.model)  # Create default instance
+        for field in dataclasses.fields(args):
+            current_val = getattr(args, field.name)
+            default_val = getattr(default_args, field.name)
+            if current_val != default_val:
+                non_default_args[field.name] = current_val
+        if default_args.model != EngineArgs.model:
+            non_default_args["model"] = default_args.model
+    else:
+        raise TypeError("Unsupported argument type. " \
+        "Must be Namespace or EngineArgs instance.")
+
+    logger.info("non-default args: %s", non_default_args)
